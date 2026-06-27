@@ -147,7 +147,6 @@ def find_optimal_session_offset(
     starts = valid_ranges.select(F.col("valid_min").alias("offset_point"), F.lit(1).alias("point_value"))
     ends = valid_ranges.select((F.col("valid_max") + 1).alias("offset_point"), F.lit(-1).alias("point_value"))
 
-    valid_ranges.show(truncate=False)
 
     timeline = starts.union(ends)
 
@@ -184,8 +183,6 @@ def find_optimal_session_offset(
         F.abs(F.col("best_offset")).asc(),
         F.col("best_offset").desc(), #positive offset better then negative
     )
-    print('ranked')
-    ranked.show(truncate=False)
     optimal_row = ranked.first()
 
     if optimal_row is None:
