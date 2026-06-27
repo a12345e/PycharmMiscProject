@@ -15,11 +15,19 @@ def spark_session():
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
     """Fixture to manage a local Spark Session lifecycle during tests."""
-    spark = SparkSession.builder \
-        .master("local[1]") \
-        .appName("PytestSessionOffsetTwoKeys") \
-        .config("spark.sql.session.timeZone", "UTC") \
-        .getOrCreate()
+    spark = (
+        SparkSession.builder
+        .master("local[1]")  # Limit threads per worker to 1 or 2 max
+        .appName(f"pytest-spark")
+        # Core Speed Optimizations:
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.shuffle.partitions", "1")  # DEFAULT IS 200 (Huge bottleneck)
+        .config("spark.default.parallelism", "1")
+        .config("spark.ui.enabled", "false")  # Disable Web UI overhead
+        # Isolation for Parallel Workers:
+        .config("spark.sql.warehouse.dir", f"/tmp/spark-warehouse-aa")
+        .config("spark.driver.extraJavaOptions", "-Djava.net.preferIPv4Stack=true")
+        .getOrCreate())
     yield spark
     spark.stop()
 
@@ -48,7 +56,7 @@ SESSION_SCHEMA = StructType([
     StructField("session_name", StringType()),
 ])
 EVENT_SCHEMA = StructType([
-    StructField("event_foreign_id", StringType()),
+    StructField("event_id", StringType()),
     StructField("event_num", IntegerType()),
     StructField("event_group", StringType()),
     StructField("event_t", TimestampType()),
@@ -119,8 +127,6 @@ SCENARIOS = [
         id="event_outside_offset_window",
     ),
 ]
-
-
 @pytest.mark.parametrize(
     "event_offsets, max_offset_seconds, expected_offset, expected_matches",
     SCENARIOS,
@@ -160,7 +166,7 @@ def test_find_optimal_session_offset(spark_session, event_offsets, max_offset_se
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",      # Mapped to 'session_id'
-        event_exact_match_col="event_foreign_id",  # Mapped to 'event_foreign_id'
+        event_exact_match_col="event_id",  # Mapped to 'event_id'
     )
 
     # Assert
@@ -244,7 +250,7 @@ def test_multiple_sessions_single_event(spark_session, direction, expected_offse
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: 5 of the 10 sessions overlap at the chosen offset.
@@ -312,7 +318,7 @@ def test_ten_tokens_best_offset_is_fifteen_minutes(spark_session):
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: shifting sessions back 15 minutes aligns all 20 event/session pairs.
@@ -353,7 +359,7 @@ def test_events_unmatchable_within_max_offset_are_ignored(spark_session):
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: only the 4 reachable events count; the 6 unreachable ones are ignored.
@@ -399,7 +405,7 @@ def test_wrong_exact_match_or_out_of_number_range_are_ignored(spark_session):
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: only the 3 valid events join; the 6 mismatching events are ignored.
@@ -443,7 +449,7 @@ def test_single_session_event_inside_gives_zero_offset(spark_session):
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: no shift needed.
@@ -549,9 +555,138 @@ def test_events_inside_all_sessions_gives_zero_offset(
         session_number_upper_bound_col="session_upper_num",
         event_number_col="event_num",
         session_exact_match_col="session_id",
-        event_exact_match_col="event_foreign_id",
+        event_exact_match_col="event_id",
     )
 
     # Assert: events already inside their sessions need no shift.
     assert optimal_offset == 0
+    assert max_matches == expected_matches
+
+
+# --- Very simple one-session scenarios over a 10:00-11:00 window -------------
+#
+# Single session [10:00, 11:00], number range [1000, 2000], max_offset 3600s.
+# Every event uses number 1500 (inside the range) so the join always succeeds
+# and only the event TIMES drive the result.
+#
+#   1. event at 10:00 (session start)  -> already inside -> offset 0, 1 match.
+#   2. event at 11:00 (session end)    -> already inside (inclusive) -> 0, 1.
+#   3. five events at 11:00, 10:01, 10:59, 09:59, 11:01. Each event's offset
+#      interval is [event_t - 11:00, event_t - 10:00] (clipped to +/-3600):
+#         11:00 -> [   0, 3600]
+#         10:01 -> [-3540,  60]
+#         10:59 -> [ -60, 3540]
+#         09:59 -> [-3600, -60]   (clipped)
+#         11:01 -> [  60, 3600]   (clipped)
+#      The unique max-overlap point is +60, covered by 11:00/10:01/10:59/11:01
+#      -> offset 60, 4 matches.
+
+SIMPLE_SESSION_START = datetime(2026, 1, 1, 10, 0, 0)
+SIMPLE_SESSION_END = datetime(2026, 1, 1, 11, 0, 0)
+
+
+def _minutes(h, m):
+    """A timestamp on the test day at hour h, minute m."""
+    return datetime(2026, 1, 1, h, m, 0)
+
+
+SIMPLE_SCENARIOS = [
+    pytest.param(
+        [_minutes(10, 0)],
+        0, 1,
+        id="event_at_session_start",
+    ),
+    pytest.param(
+        [_minutes(11, 0)],
+        0, 1,
+        id="event_at_session_end",
+    ),
+    pytest.param(
+        [_minutes(11, 1), _minutes(10, 0)
+         ],
+        0, 1,
+        id="two events one inside another with positive offset required peek ad not offset",
+    ),
+    pytest.param(
+        [_minutes(11, 0), _minutes(9, 59)
+         ],
+        0, 1,
+        id="two events one inside another with negative offset required peek ad not offset",
+    ),
+    pytest.param(
+        [_minutes(10, 30), _minutes(9, 59)
+         ],
+        -60, 2,
+        id="one event in the session middle and another below but not far below",
+    ),
+    pytest.param(
+        [_minutes(10, 30), _minutes(11, 1)
+         ],
+        60, 2,
+        id="one event in the session middle and another upper but not far upper",
+    ),
+    pytest.param(
+            [_minutes(10, 30), _minutes(10, 31),_minutes(10, 29),
+                    _minutes(12, 30), _minutes(12, 31),_minutes(12, 22)],
+        0, 3,
+        id="three outsiders require positive offset and three cannot do with the minimal offset for the outsiders so offsset=0",
+    ),
+    pytest.param(
+            [_minutes(10, 30), _minutes(10, 31),_minutes(10, 29),
+                    _minutes(8, 30), _minutes(8, 31),_minutes(8, 22)],
+        0, 3,
+        id="three outsiders require negative offset and three cannot do with the minimal offset for the outsiders so offsset=0",
+    ),
+    pytest.param(
+            [_minutes(10, 30), _minutes(11, 30)],
+        1800, 2,
+        id="one inside in the middle and another outside such offset 30 is good for both",
+    ),
+    pytest.param(
+            [_minutes(10, 30), _minutes(11, 31)],
+        0, 1,
+        id="one is above but too far for offset to work",
+    ),
+    pytest.param(
+        [_minutes(11, 0), _minutes(10, 1), _minutes(10, 59),
+         _minutes(9, 59), _minutes(11, 1)],
+        60, 4,
+        id="five_events_peak_at_plus_60",
+    ),
+]
+@pytest.mark.parametrize("event_times, expected_offset, expected_matches", SIMPLE_SCENARIOS)
+def test_simple_one_session_scenarios(spark_session, event_times,
+                                      expected_offset, expected_matches):
+    # Arrange: one session [10:00, 11:00], number range [1000, 2000].
+    session_df = spark_session.createDataFrame(
+        [("match", 2000, 1000, SIMPLE_SESSION_START, SIMPLE_SESSION_END, "S")],
+        SESSION_SCHEMA,
+    )
+    # Every event uses number 1500, which is inside [1000, 2000].
+    event_df = spark_session.createDataFrame(
+        [("match", 1500, "G", t) for t in event_times], EVENT_SCHEMA
+    )
+
+    print("session_df")
+    session_df.show(truncate=False)
+    print("event_df")
+    event_df.show(truncate=False)
+
+    # Act
+    optimal_offset, max_matches = find_optimal_session_offset(
+        session_df=session_df,
+        event_df=event_df,
+        max_offset_seconds=3600,
+        session_start_time_col="session_start_t",
+        session_end_time_col="session_end_t",
+        event_time_col="event_t",
+        session_number_lower_bound_col="session_lower_num",
+        session_number_upper_bound_col="session_upper_num",
+        event_number_col="event_num",
+        session_exact_match_col="session_id",
+        event_exact_match_col="event_id",
+    )
+
+    # Assert
+    assert optimal_offset == expected_offset
     assert max_matches == expected_matches
