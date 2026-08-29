@@ -1,0 +1,21 @@
+Prepare a another function in a separate file and a test file:
+def compute_closure_by_time_proximity(
+        closure_of: DataFrame,
+        closure_from: DataFrame,
+        group_by_columns: list[str],
+        aggs: list[Aggregation],
+        max_interval_seconds: int,
+        start_time_column: str,
+        end_time_column: str,
+        period: PeriodPartition = None,
+) -> DataFrame
+"""
+ This function takes the closure_of dataframe, and enriches it with with rows in the closure_from dataframe.
+ The computation of the closure is done by time proximity and group by columns.
+ If there there is period then it is used to make proximity computation easier.
+ Validation is for the max_interval_seconds to be <= period.minimal_period.
+ validation is also for the closure_of to see that the start-end times are in the same period when there is a period.
+ Do same Validation afterwards to the closure_from but only for the periods that are either in the closure_of or +/- 1 period.
+"""
+
+Make sure that the common code of this and time_stretch.py is in a separate file.
