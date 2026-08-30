@@ -6,7 +6,7 @@ import random
 import pytest
 import pyspark.sql.functions as F
 
-from conftest import at, frame, hhmm, rows_of, segments
+from tests.conftest import at, frame, hhmm, rows_of, segments
 from time_closure import compute_closure_by_time_proximity
 from time_periods import PeriodPartition
 

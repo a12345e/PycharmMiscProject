@@ -7,7 +7,7 @@ import pytest
 import pyspark.sql.functions as F
 from pyspark.sql.window import Window
 
-from conftest import SIX_HOURS, at, frame, hhmm, rows_of
+from tests.conftest import SIX_HOURS, at, frame, hhmm, rows_of
 from time_periods import (
     PeriodPartition,
     agg_name,

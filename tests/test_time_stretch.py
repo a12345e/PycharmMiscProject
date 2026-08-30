@@ -7,7 +7,7 @@ import random
 import pytest
 import pyspark.sql.functions as F
 
-from conftest import SEGMENT_COLUMNS, at, frame, hhmm, rows_of, segments
+from tests.conftest import SEGMENT_COLUMNS, at, frame, hhmm, rows_of, segments
 from time_periods import PeriodPartition, split_on_period_borders
 from time_stretch import _assign_chain_ids, _validate, time_stretch
 

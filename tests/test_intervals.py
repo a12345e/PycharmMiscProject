@@ -9,7 +9,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType,
 )
 
-from intervals import remove_contained_intervals
+from time_intervals import remove_contained_intervals
 
 
 @pytest.fixture(scope="session")
@@ -268,7 +268,7 @@ def test_custom_column_names(spark_session):
 
     # Act
     result = remove_contained_intervals(
-        df, key_col="device", start_col="from_t", end_col="to_t"
+        df, group_by_cols=["device"], start_col="from_t", end_col="to_t"
     )
 
     # Assert
@@ -279,6 +279,100 @@ def test_custom_column_names(spark_session):
         ("d1", _t(9), _t(15)),
         ("d2", _t(3), _t(7)),
     ]
+
+
+# --- Grouping by several columns -------------------------------------------
+
+MULTI_KEY_SCHEMA = StructType([
+    StructField("tenant", StringType()),
+    StructField("device", StringType()),
+    StructField("start_time", TimestampType()),
+    StructField("end_time", TimestampType()),
+])
+
+
+def _multi_key_df(spark_session, intervals):
+    """(tenant, device, start, end) integer tuples -> DataFrame."""
+    rows = [
+        (tenant, device, _t(start), _t(end))
+        for tenant, device, start, end in intervals
+    ]
+    return spark_session.createDataFrame(rows, MULTI_KEY_SCHEMA)
+
+
+def _collect_multi_key(df):
+    """Result rows back as sorted (tenant, device, start_min, end_min) tuples."""
+    return sorted(
+        (
+            row["tenant"],
+            row["device"],
+            int((row["start_time"] - BASE_TIME).total_seconds() // 60),
+            int((row["end_time"] - BASE_TIME).total_seconds() // 60),
+        )
+        for row in df.collect()
+    )
+
+
+# The same input feeds the two tests below, so the only difference between the
+# expected results is how wide the group is.
+MULTI_KEY_INTERVALS = [
+    ("t1", "d1", 0, 10),
+    ("t1", "d1", 2, 5),    # contained in (t1, d1, 0, 10)
+    ("t1", "d2", 2, 5),    # other device -> survives when device is a group col
+    ("t2", "d1", 0, 10),   # other tenant -> survives only when tenant is one too
+    ("t2", "d1", 2, 5),
+]
+
+
+def test_grouping_by_two_columns(spark_session):
+    """Containment is scoped to the full (tenant, device) pair."""
+    # Arrange
+    df = _multi_key_df(spark_session, MULTI_KEY_INTERVALS)
+
+    # Act
+    result = remove_contained_intervals(df, group_by_cols=["tenant", "device"])
+
+    # Assert
+    assert _collect_multi_key(result) == [
+        ("t1", "d1", 0, 10),
+        ("t1", "d2", 2, 5),
+        ("t2", "d1", 0, 10),
+    ]
+
+
+def test_dropping_a_group_column_widens_the_group(spark_session):
+    """Grouping by device alone merges the two tenants: their identical
+    intervals now contain each other, so one copy of each survives."""
+    # Arrange
+    df = _multi_key_df(spark_session, MULTI_KEY_INTERVALS)
+
+    # Act
+    result = remove_contained_intervals(df, group_by_cols=["device"])
+
+    # Assert: which tenant's copy of (d1, 0, 10) survives is arbitrary, so the
+    # tenant is dropped from the comparison.
+    assert sorted(
+        (device, start, end)
+        for _, device, start, end in _collect_multi_key(result)
+    ) == [
+        ("d1", 0, 10),
+        ("d2", 2, 5),
+    ]
+
+
+def test_empty_group_by_cols_treats_all_rows_as_one_group(spark_session):
+    """With no grouping columns, containment is global across the DataFrame."""
+    # Arrange
+    df = spark_session.createDataFrame(
+        _to_rows([("a", 0, 10), ("b", 2, 5), ("c", 3, 20)]), SCHEMA
+    )
+
+    # Act
+    result = remove_contained_intervals(df, group_by_cols=[])
+
+    # Assert: ("b", 2, 5) is contained in ("a", 0, 10) despite the different key.
+    assert _collect_triples(result) == [("a", 0, 10), ("c", 3, 20)]
+
 
 
 # --- Randomized cross-check against the brute-force reference ---------------
